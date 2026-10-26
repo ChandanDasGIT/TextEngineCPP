@@ -1,0 +1,54 @@
+Here's what I'd add, in the order I'd do it. The first group matters most because folding and syntax highlighting will depend on it.
+
+needs validation: {## 1. Foundations (do before folding and highlighting)
+- Change notifications: every edit reports "range X was replaced by this text", plus a document version number.
+  - Highlighting needs it to re-color only the changed lines, folding needs it to shift fold ranges, and your LSP client needs it for `didChange`.
+  - All edits already go through `applyEdits`, so it's the one place to hook in.
+- Unicode-aware columns: columns are still bytes, so `é` and emoji break cursor movement, selection, wrapping and clicks.
+  - Move by whole characters and measure screen width (wide CJK characters take 2 cells).
+  - LSP positions use UTF-16 units, so a conversion helper belongs here too.
+  - It's much easier now than after highlighting and folding exist.
+- Tab handling: converting tabs to 4 spaces on load means saving silently rewrites the file, which will damage Makefiles and Go files.
+  - Better to keep real tab characters and draw them as 4 columns, with a "spaces or tabs" setting.
+- Faster buffer and undo for big files: a `vector<string>` of lines gets slow on files with 100k+ lines, and snapshot undo copies the whole document each step.
+  - Switch undo to storing only the changes. The `TextView` functions don't need to change.
+  }
+
+done: {## 2. Everyday editing you'll miss quickly
+- Word movement: Ctrl+Left/Right, Ctrl+Shift+Left/Right, Ctrl+Backspace and Ctrl+Delete.
+- Auto-indent: Enter keeps the indentation of the current line.
+- Indent and outdent: Tab and Shift+Tab on selected lines.
+- Smart Home: goes to the first non-space character, then to column 0 on a second press.
+- Comment toggle: Ctrl+/, using the language's comment marker.
+- Brackets:
+  - Auto-close of `()`, `[]`, `{}` and quotes
+  - Highlight the matching bracket
+  - Jump to it
+- Go to line: Ctrl+G.
+- Double-click and triple-click: select the word or the whole line.
+- System clipboard: copy and paste through the terminal's OSC 52 sequence, since your clipboard is currently internal only. Keeping formatting on paste would need a richer internal clipboard.
+}
+## 3. Search and multicursor upgrades
+- Find options: whole word, regex and find in selection.
+- Multi-line search: matches that span lines.
+- Select all occurrences: one key to put a cursor on every match.
+- Replace: whole word, part or multiline...like kate and vs code
+- need this as a separate dialogue for find and replace either floating on top (like vs code) or pinned at bottom (like kate)
+
+
+## 5. File handling extras
+- External change detection: warn when the file changes on disk while you're editing.
+- Autosave or recovery files: so a crash doesn't lose work.
+
+#
+- Status bar: show line-ending style (LF/CRLF) and encoding. --> done
+
+
+If you only do three things before folding and highlighting, I'd pick change notifications, Unicode columns and the tab fix. Everything else can wait, but those three get painful to retrofit once other features depend on the current behavior.
+
+///////////////
+1. sticky scroll -done
+2. auto numbering when press enter --done
+3. code folding --done
+4. highlighter --done
+5. minimap -- done

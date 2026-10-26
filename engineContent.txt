@@ -1,0 +1,45 @@
+engine/textbuffer/textbuffer.h and textbuffer.cpp:
+(Stores the text itself, as a list of lines. It knows nothing about cursor, selection or keyboard.)
+    {
+    --Position: a struct with line and col, plus ==, != and < comparisons
+    --lineCount(), lineLength(line), line(index): read the text line by line
+    --text(): the whole text as one string, lines joined with \n
+    --clamp(p): forces a position to be valid (inside the text)
+    --endPosition(): the position after the last character
+    --textInRange(from, to): returns the text between two positions
+    --insert(at, s): inserts a string (newlines split lines) and returns the position after it
+    --erase(from, to): deletes everything between two positions, merging lines if needed
+    }
+
+engine/textview/textview.h and textview.cpp:
+(Owns a TextBuffer plus the cursor and selection. This is the class the UI talks to.)
+    {
+    --Editing: insertText, backspace, del (Delete key), enter. If something is selected, typing or deleting replaces or removes the selection first
+    --Cursor movement: moveCursor(p, extend), moveLeft, moveRight, moveUp, moveDown, moveHome, moveEnd. Passing extend = true extends the selection instead of clearing it
+    --Up/down memory: remembers the column you were in, so moving up and down across short lines returns to it
+    --Selection: select(from, to), selectAll, hasSelection, selectionStart, selectionEnd, selectedText
+    --Clipboard: copy, cut, paste. The caller stores the clipboard string
+    --Queries: cursor(), text(), buffer()  
+    }
+
+engine/inputHandler/inputhandler.h and inputhandler.cpp:
+(Translates raw terminal bytes into TextView calls. This file is terminal-specific, not engine logic.)
+    {
+    --InputState: holds the test clipboard string, the status message for the bottom bar, and the running flag
+    --handleInput(buf, n, view, state):
+        //Printable characters: insertText
+        //Backspace, Enter, Tab (inserts 4 spaces)
+        //Arrow keys, Home, End, Delete, and Shift versions of them for selection
+        //Mouse click: moveCursor, mouse drag: moveCursor(p, true)
+        //Ctrl+A, Ctrl+C, Ctrl+X, Ctrl+V: select all, copy, cut, paste
+        //Ctrl+Q: sets running = false
+    }
+
+test.cpp:
+(The terminal program itself. It has no editing logic.)
+    {
+    --setupTerminal(): puts the terminal into raw mode, switches to a blank full-screen page, and turns on mouse reporting
+    --restoreTerminal(): undoes all of that on exit
+    --render(view, status): draws the text, highlights the selection, shows the status bar with cursor position and last action, and places the cursor
+    --main(): loop that reads bytes, passes them to handleInput, then redraws
+    }

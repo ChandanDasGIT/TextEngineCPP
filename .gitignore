@@ -1,0 +1,53 @@
+# Build output directories (handles build, build-release, Qt Creator kits)
+build*/
+bin/
+lib/
+AppDir/
+dist/
+tools/
+
+# Release archives & packaged binaries
+*.tar.xz
+*.tar.gz
+*.tar.bz2
+*.zip
+*.AppImage
+
+# CMake artifacts & caches (recursive)
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+CMakeUserPresets.json
+compile_commands.json
+*.ninja
+*.ninja_deps
+*.ninja_log
+*.cmake.check_cache
+
+# Qt Creator & Language Server specific
+*.user
+*.user.*
+.qtc_clangd/
+.cache/
+
+# Autogen / MOC / RCC files
+*_autogen/
+*.moc
+moc_*.cpp
+qrc_*.cpp
+ui_*.h
+
+# Qt 6 QML module generated files
+*_qmltyperegistrations.cpp
+*.qmltypes
+*.metatypes.json
+
+# System & editor metadata
+.DS_Store
+*.swp
+*.swo
+*~
+.directory
+.vscode/
+.idea/
+.kateconfig
