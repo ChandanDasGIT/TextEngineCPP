@@ -1,0 +1,703 @@
+#include "inputhandler.h"
+#include <algorithm> // IWYU pragma: keep
+#include <cctype>
+#include <cstdlib>
+#include <string>
+#include <vector> // IWYU pragma: keep
+#include "../fileIO/fileio.h"
+#include "../findpanel/findpanel.h"
+
+namespace {
+
+using Mods = Input::Mods;
+
+// While the find bar is open but you clicked on the text, keys work as in normal editing: for the length of one
+// event the mode is switched to Edit, and put back afterwards (unless the event closed or changed the bar).
+struct EditorKeys {
+    InputState& st;
+    TextView& view;
+    InputMode saved;
+    bool on;
+    EditorKeys(InputState& s, TextView& v, bool enable)
+        : st(s), view(v), saved(s.mode),
+          on(enable && s.editorFocus && (s.mode == InputMode::Find || s.mode == InputMode::Replace)) {
+        if (on) st.mode = InputMode::Edit;
+    }
+    ~EditorKeys() {
+        if (!on) return;
+        if (st.mode == InputMode::Edit && st.editorFocus) st.mode = saved;                    // the bar stays open
+        else if (st.mode == InputMode::Prompt) { view.clearFind(); st.editorFocus = false; }  // Save as / Open: the bar goes
+        else st.editorFocus = false;                                                          // closed, or Ctrl+F / Ctrl+R
+    }
+    EditorKeys(const EditorKeys&) = delete;
+    EditorKeys& operator=(const EditorKeys&) = delete;
+};
+
+// Every event first moves the "as it was when this event arrived" memory one step on.
+void beginEvent(InputState& st, bool isMouse) {
+    st.armedBefore = st.armed;            // any event cancels a "press again" warning,
+    st.armed = Armed::None;               // unless the event itself sets it again
+    st.fieldSelPrev = st.fieldSelected;   // any event ends a field selection,
+    st.fieldSelected = false;             // unless the event itself (Ctrl+A, Ctrl+C) sets it again
+    if (!isMouse) {                       // any key ends the "selected with the mouse" state,
+        st.editorSelPrev = st.editorSelected;   // unless the key itself (Ctrl+C) sets it again
+        st.editorSelected = false;
+    }
+}
+
+// ---------------------------------------------------------------- find bar and file name bar
+
+std::string& activeField(InputState& st) {
+    return (st.mode == InputMode::Replace && st.replaceFieldActive) ? st.replaceText : st.findText;
+}
+
+bool typingInFindField(const InputState& st) {
+    return st.mode == InputMode::Find || (st.mode == InputMode::Replace && !st.replaceFieldActive);
+}
+
+FindOptions findOptionsOf(const InputState& st) {
+    FindOptions o;
+    o.matchCase = st.findCase;
+    o.wholeWord = st.findWord;
+    o.regex = st.findRegex;
+    o.inSelection = st.findInSel;
+    return o;
+}
+
+void runFind(TextView& view, InputState& st) { view.findSetQuery(st.findText, findOptionsOf(st)); }
+
+std::string escapeRegex(const std::string& s) {
+    const std::string special = "\\^$.|?*+()[]{}";
+    std::string out;
+    for (char c : s) {
+        if (special.find(c) != std::string::npos) out += '\\';
+        out += c;
+    }
+    return out;
+}
+
+void openFind(TextView& view, InputState& st, bool withReplace) {
+    if (st.mode == InputMode::Edit) {
+        view.findOpen();
+        st.findInSel = false;
+        if (view.hasSelection()) {
+            std::string sel = view.selectedText();
+            if (sel.find('\n') == std::string::npos) st.findText = st.findRegex ? escapeRegex(sel) : sel;   // start with the selected text
+            else st.findInSel = true;                           // several lines selected: search inside them
+        }
+        st.status = "find: Alt+C case, Alt+W word, Alt+R regex, Alt+L selection, Alt+Enter select all";
+    }
+    st.mode = withReplace ? InputMode::Replace : InputMode::Find;
+    st.replaceFieldActive = false;
+    runFind(view, st);
+}
+
+void closeFind(TextView& view, InputState& st) {
+    st.mode = InputMode::Edit;
+    st.editorFocus = false;
+    st.replaceFieldActive = false;
+    st.findInSel = false;
+    view.clearFind();
+    st.status = "find closed";
+}
+
+void selectAllFromPanel(TextView& view, InputState& st) {
+    if (!view.selectAllMatches()) { st.status = "no matches"; return; }
+    size_t n = view.cursorCount();
+    st.mode = InputMode::Edit;
+    st.editorFocus = false;
+    st.replaceFieldActive = false;
+    st.findInSel = false;
+    view.clearFind();
+    st.status = std::to_string(n) + " cursors on all matches";
+}
+
+void toggleFindOption(char l, TextView& view, InputState& st) {
+    if (l == 'c') { st.findCase = !st.findCase; st.status = st.findCase ? "case sensitive" : "ignore case"; }
+    else if (l == 'w') { st.findWord = !st.findWord; st.status = st.findWord ? "whole word" : "part of words too"; }
+    else if (l == 'r') { st.findRegex = !st.findRegex; st.status = st.findRegex ? "regex on" : "regex off"; }
+    else if (l == 'l') { st.findInSel = !st.findInSel; st.status = st.findInSel ? "in selection" : "whole text"; }
+    else return;
+    runFind(view, st);
+    if (st.findInSel && !view.findScoped()) st.status = "select text before opening find to search inside it";
+}
+
+// A click on a control of the find panel.
+void panelAction(FindPanel::Action a, TextView& view, InputState& st) {
+    using A = FindPanel::Action;
+    switch (a) {
+        case A::Prev: view.findPrev(); st.status = "previous match"; break;
+        case A::Next: view.findNext(); st.status = "next match"; break;
+        case A::SelectAll: selectAllFromPanel(view, st); break;
+        case A::ToggleCase: toggleFindOption('c', view, st); break;
+        case A::ToggleWord: toggleFindOption('w', view, st); break;
+        case A::ToggleRegex: toggleFindOption('r', view, st); break;
+        case A::ToggleSelection: toggleFindOption('l', view, st); break;
+        case A::Close: closeFind(view, st); break;
+        case A::Replace:
+            if (st.mode == InputMode::Replace) st.status = view.replaceCurrent(st.replaceText) ? "replaced" : "next match";
+            break;
+        case A::ReplaceAll:
+            if (st.mode == InputMode::Replace) {
+                size_t n = view.replaceAll(st.replaceText);
+                st.status = "replaced " + std::to_string(n);
+            }
+            break;
+        case A::FocusFind: st.replaceFieldActive = false; break;
+        case A::FocusReplace: if (st.mode == InputMode::Replace) st.replaceFieldActive = true; break;
+        case A::None: break;
+    }
+}
+
+void popChar(std::string& s) {   // removes one whole UTF-8 character
+    while (!s.empty() && (static_cast<unsigned char>(s.back()) & 0xC0) == 0x80) s.pop_back();
+    if (!s.empty()) s.pop_back();
+}
+
+void openPrompt(InputState& st, PromptKind kind) {
+    st.mode = InputMode::Prompt;
+    st.promptKind = kind;
+    st.browser.open(kind == PromptKind::SaveAs ? FileBrowser::Mode::SaveAs : FileBrowser::Mode::Open, st.filePath);
+    st.status = kind == PromptKind::SaveAs ? "save as" : "open file";
+}
+
+// Carries out what the file browser reported: a picked file is opened, or saved to.
+void acceptBrowserResult(const FileBrowser::Result& r, InputState& st) {
+    if (r.kind != FileBrowser::Result::Choose) {
+        if (!r.message.empty()) st.status = r.message;
+        return;
+    }
+    const std::string& path = r.path;
+
+    if (st.promptKind == PromptKind::SaveAs) {
+        bool otherFile = path != st.filePath;
+        if (otherFile && FileIO::exists(path) && st.armedBefore != Armed::Overwrite) {
+            st.armed = Armed::Overwrite;
+            st.status = "file exists - press Enter again to overwrite it";
+            return;
+        }
+        st.post(Request::of(Request::Kind::SaveFileAs, 0, path));
+    } else {
+        st.post(Request::of(Request::Kind::OpenFile, 0, path));
+    }
+    st.mode = InputMode::Edit;
+}
+
+void submitPrompt(InputState& st) { acceptBrowserResult(st.browser.activate(), st); }
+
+// ---------------------------------------------------------------- text, paste and single keys
+
+// \r and \r\n become \n
+std::string normalizedPaste(const std::string& s) {
+    std::string o;
+    for (size_t i = 0; i < s.size(); ++i) {
+        if (s[i] == '\r') {
+            o += '\n';
+            if (i + 1 < s.size() && s[i + 1] == '\n') ++i;
+        } else {
+            o += s[i];
+        }
+    }
+    return o;
+}
+
+// Pasted text goes to whatever has the keyboard: the editor, a find / replace field or the file browser.
+void pasteText(const std::string& raw, TextView& view, InputState& st) {
+    std::string s = normalizedPaste(raw);
+    if (s.empty()) return;
+
+    if (st.mode == InputMode::Edit) {
+        view.paste(s);
+        st.status = "paste";
+        return;
+    }
+    if (st.mode == InputMode::Prompt) {                        // a path has no line breaks
+        std::string one;
+        for (char c : s)
+            if (c != '\n') one += c;
+        st.browser.typeText(one);
+        return;
+    }
+    if (st.fieldSelPrev) activeField(st).clear();              // pasting over a selected field replaces it
+    activeField(st) += s;                                      // line breaks stay: searches can span lines
+    if (typingInFindField(st)) runFind(view, st);
+    st.status = "pasted";
+}
+
+void typeText(const std::string& s, TextView& view, InputState& st) {
+    if (st.mode == InputMode::Edit) {
+        view.insertText(s);
+        st.status = "type";
+        return;
+    }
+    if (st.mode == InputMode::Prompt) { st.browser.typeText(s); return; }
+    if (st.fieldSelPrev) activeField(st).clear();             // typing over a selected field replaces it
+    for (char c : s)
+        if (c != '\r' && c != '\n') activeField(st) += c;
+    if (typingInFindField(st)) runFind(view, st);
+}
+
+void backspaceKey(bool word, TextView& view, InputState& st) {
+    if (st.mode == InputMode::Edit) {
+        if (word) { view.deleteWord(false); st.status = "delete word"; }
+        else { view.backspace(); st.status = "backspace"; }
+        return;
+    }
+    if (st.mode == InputMode::Prompt) { st.browser.backspace(word); return; }
+    if (st.fieldSelPrev) activeField(st).clear();
+    else popChar(activeField(st));
+    if (typingInFindField(st)) runFind(view, st);
+}
+
+void deleteKey(Mods m, TextView& view, InputState& st) {
+    if (st.mode != InputMode::Edit) return;
+    if (m.ctrl) { view.deleteWord(true); st.status = "delete word"; }
+    else { view.del(); st.status = "delete"; }
+}
+
+void enterKey(TextView& view, InputState& st, Mods m) {
+    if (st.mode == InputMode::Prompt) { submitPrompt(st); return; }
+    if (st.mode == InputMode::Edit) { view.enter(); st.status = "enter"; return; }
+
+    if (m.alt) { selectAllFromPanel(view, st); return; }                // Alt+Enter: a cursor on every match
+    if (m.ctrl) {                                                       // Ctrl+Enter: a line break in the field
+        if (st.fieldSelPrev) activeField(st).clear();
+        activeField(st) += '\n';
+        if (typingInFindField(st)) runFind(view, st);
+        return;
+    }
+    if (st.mode == InputMode::Replace && st.replaceFieldActive) {
+        st.status = view.replaceCurrent(st.replaceText) ? "replaced" : "next match";
+    } else if (m.shift) {
+        view.findPrev();
+        st.status = "previous match";
+    } else {
+        view.findNext();
+        st.status = "next match";
+    }
+}
+
+void tabKey(bool shift, TextView& view, InputState& st) {
+    if (st.mode == InputMode::Prompt) return;
+    if (st.mode == InputMode::Edit) {
+        if (shift) { view.shiftTab(); st.status = "outdent"; }
+        else { view.tab(); st.status = "tab"; }
+    } else if (st.mode == InputMode::Find) {
+        st.mode = InputMode::Replace;
+        st.replaceFieldActive = true;
+    } else {
+        st.replaceFieldActive = !st.replaceFieldActive;
+    }
+}
+
+void escapeKey(TextView& view, InputState& st) {
+    if (st.editorFocus) { closeFind(view, st); return; }         // the text has the keyboard, the find bar is still open
+    if (st.mode == InputMode::Prompt) {
+        st.mode = InputMode::Edit;
+        st.status = "cancelled";
+    } else if (st.mode != InputMode::Edit) {
+        closeFind(view, st);
+    } else if (view.cursorCount() > 1) {
+        view.clearExtraCursors();
+        st.status = "single cursor";
+    }
+}
+
+void arrowKey(Input::Key dir, Mods m, TextView& view, InputState& st) {
+    using Input::Key;
+    if (st.mode == InputMode::Prompt) {                      // the file browser
+        if (dir == Key::Up && m.alt) st.browser.goUp();      // Alt+Up: parent folder
+        else if (dir == Key::Up) st.browser.moveSelection(-1);
+        else if (dir == Key::Down) st.browser.moveSelection(1);
+        return;
+    }
+    if (st.mode != InputMode::Edit) {        // in the find bar, Up and Down jump between matches
+        if (dir == Key::Up) { view.findPrev(); st.status = "previous match"; }
+        if (dir == Key::Down) { view.findNext(); st.status = "next match"; }
+        return;
+    }
+    if (dir == Key::Up || dir == Key::Down) {
+        if (m.alt && m.ctrl) {                                // Ctrl+Alt+Up/Down: add a cursor
+            if (dir == Key::Up) view.addCursorAbove(); else view.addCursorBelow();
+            st.status = "add cursor";
+            return;
+        }
+        if (m.alt && m.shift) {                               // Alt+Shift+Up/Down: duplicate lines
+            view.duplicateLines(dir == Key::Down);
+            st.status = "duplicate lines";
+            return;
+        }
+        if (m.alt) {                                          // Alt+Up/Down: move lines
+            view.moveLines(dir == Key::Up);
+            st.status = "move lines";
+            return;
+        }
+    }
+    switch (dir) {
+        case Key::Up: view.moveUp(m.shift); st.status = "up"; break;
+        case Key::Down: view.moveDown(m.shift); st.status = "down"; break;
+        case Key::Right:
+            if (m.ctrl) { view.moveWordRight(m.shift); st.status = "word right"; }
+            else { view.moveRight(m.shift); st.status = "right"; }
+            break;
+        case Key::Left:
+            if (m.ctrl) { view.moveWordLeft(m.shift); st.status = "word left"; }
+            else { view.moveLeft(m.shift); st.status = "left"; }
+            break;
+        default: break;
+    }
+}
+
+void homeKey(Mods m, TextView& view, InputState& st) {
+    if (st.mode == InputMode::Prompt) { st.browser.selectFirst(); return; }
+    if (st.mode != InputMode::Edit) return;
+    view.moveHome(m.shift);
+    st.status = "home";
+}
+
+void endKey(Mods m, TextView& view, InputState& st) {
+    if (st.mode == InputMode::Prompt) { st.browser.selectLast(); return; }
+    if (st.mode != InputMode::Edit) return;
+    view.moveEnd(m.shift);
+    st.status = "end";
+}
+
+void pageKey(bool down, Mods m, TextView& view, InputState& st) {
+    if (st.mode == InputMode::Prompt) {
+        int rows = static_cast<int>(st.browser.pageRows());
+        st.browser.moveSelection(down ? rows : -rows);
+        return;
+    }
+    if (st.mode != InputMode::Edit) return;
+    size_t n = st.pageRows > 1 ? st.pageRows - 1 : 1;   // keep one row of overlap
+    for (size_t i = 0; i < n; ++i) {
+        if (down) view.moveDown(m.shift);
+        else view.moveUp(m.shift);
+    }
+    st.status = down ? "page down" : "page up";
+}
+
+void ctrlLetter(char l, Mods m, TextView& view, InputState& st) {
+    if (st.mode == InputMode::Prompt) return;                            // nothing else works in the file browser
+
+    if (l == 'f') { openFind(view, st, false); return; }                // Ctrl+F
+    if (l == 'r') { openFind(view, st, true); return; }                 // Ctrl+R
+    if (st.mode == InputMode::Find || st.mode == InputMode::Replace) {   // keys inside a find / replace field
+        std::string& field = activeField(st);
+        if (l == 'v') { pasteText(st.clipboard, view, st); return; }
+        if (l == 'a') {
+            st.fieldSelected = !field.empty();
+            st.status = field.empty() ? "field is empty" : "field text selected";
+            return;
+        }
+        if (l == 'c' || l == 'x') {
+            if (st.editorSelPrev && view.hasSelection()) {               // text selected in the editor with the mouse
+                std::string t = l == 'x' ? view.cut() : view.copy();
+                if (!t.empty()) { st.clipboard = t; st.post(Request::of(Request::Kind::CopyToClipboard, 0, t)); }
+                if (l == 'x') runFind(view, st);                         // the text changed: search again
+                else st.editorSelected = true;                           // copying keeps the selection
+                st.status = l == 'x' ? "cut" : "copied";
+                return;
+            }
+            if (field.empty()) { st.status = "nothing to copy"; return; }
+            st.clipboard = field;
+            st.post(Request::of(Request::Kind::CopyToClipboard, 0, field));
+            if (l == 'x') {
+                field.clear();
+                if (typingInFindField(st)) runFind(view, st);
+                st.status = "cut";
+            } else {
+                st.fieldSelected = st.fieldSelPrev;                      // copying keeps the selection
+                st.status = "copied";
+            }
+            return;
+        }
+        return;
+    }
+    if (st.mode != InputMode::Edit) return;
+
+    switch (l) {
+        case 's':                                                        // Ctrl+S: save (Ctrl+Shift+S: save as)
+            if (m.shift || st.filePath.empty()) openPrompt(st, PromptKind::SaveAs);
+            else st.post(Request::of(Request::Kind::SaveFile));
+            break;
+        case 'o':                                                        // Ctrl+O: open a file
+            if (st.modified && st.armedBefore != Armed::Discard) {
+                st.armed = Armed::Discard;
+                st.status = "unsaved changes - press Ctrl+O again to open anyway";
+            } else {
+                openPrompt(st, PromptKind::Open);
+            }
+            break;
+        case 'a': view.selectAll(); st.status = "select all"; break;
+        case 'c': {
+            std::string t = view.copy();
+            if (!t.empty()) { st.clipboard = t; st.post(Request::of(Request::Kind::CopyToClipboard, 0, t)); }   // nothing selected: keep the old clipboard
+            st.status = "copy " + std::to_string(t.size()) + " bytes";
+            break;
+        }
+        case 'x': {
+            std::string t = view.cut();
+            if (!t.empty()) { st.clipboard = t; st.post(Request::of(Request::Kind::CopyToClipboard, 0, t)); }
+            st.status = "cut";
+            break;
+        }
+        case 'v': view.paste(st.clipboard); st.status = "paste"; break;
+        case 'b': view.toggleBold(); st.status = "bold"; break;
+        case 'i': view.toggleItalic(); st.status = "italic"; break;
+        case 'u': view.toggleUnderline(); st.status = "underline"; break;
+        case 'p': view.changeFontSize(1); st.status = "size +"; break;
+        case 'n': view.changeFontSize(-1); st.status = "size -"; break;
+        case 'z':
+            if (m.shift) st.status = view.redo() ? "redo" : "nothing to redo";
+            else st.status = view.undo() ? "undo" : "nothing to undo";
+            break;
+        case 'y': st.status = view.redo() ? "redo" : "nothing to redo"; break;
+        case 'd': st.status = view.addNextOccurrence() ? "add next occurrence" : "no more occurrences"; break;
+        case 'k': view.deleteLines(); st.status = "delete lines"; break;
+        default: break;
+    }
+}
+
+void altLetter(char l, TextView& view, InputState& st) {
+    if (st.mode == InputMode::Prompt) {                                 // Alt+H in the file browser: show or hide hidden files
+        if (l == 'h') st.browser.toggleHidden();
+        return;
+    }
+    if (st.mode == InputMode::Edit && l == 'm') {                       // Alt+M: show or hide the minimap
+        st.minimapOn = !st.minimapOn;
+        st.status = st.minimapOn ? "minimap on" : "minimap off";
+        return;
+    }
+    if (st.mode == InputMode::Edit && l == 's') {                       // Alt+S: save as
+        openPrompt(st, PromptKind::SaveAs);
+        return;
+    }
+    if (st.mode == InputMode::Find || st.mode == InputMode::Replace) {    // Alt+C / W / R / L, Alt+A
+        if (l == 'a' && st.mode == InputMode::Replace) {                 // Alt+A: replace all
+            size_t n = view.replaceAll(st.replaceText);
+            st.status = "replaced " + std::to_string(n);
+        }
+        else toggleFindOption(l, view, st);
+    }
+}
+
+// A key with Ctrl and/or Alt held, that is a character key.
+void charKey(const Input::KeyEvent& k, TextView& view, InputState& st) {
+    if (k.ch == 0 || k.ch >= 128) return;
+    char c = static_cast<char>(k.ch);
+    const Mods& m = k.mods;
+
+    if (m.ctrl && m.alt) {
+        if (st.mode != InputMode::Edit) return;
+        if (c == 'd') {                                                  // Ctrl+Alt+D: a cursor on every occurrence
+            st.status = view.selectAllOccurrences() ? std::to_string(view.cursorCount()) + " cursors" : "nothing to select";
+        } else if (c == '[' || c == ']') {                               // Ctrl+Alt+[ fold, Ctrl+Alt+] unfold (+Shift = all)
+            bool open = c == '[';
+            if (m.shift) {
+                if (open) view.foldAll(); else view.unfoldAll();
+                st.status = open ? "fold all" : "unfold all";
+            } else {
+                bool ok = open ? view.foldAtCursor() : view.unfoldAtCursor();
+                st.status = ok ? (open ? "fold" : "unfold") : "nothing to fold";
+            }
+        }
+        return;
+    }
+    if (m.ctrl) {
+        if (c >= 'a' && c <= 'z') ctrlLetter(c, m, view, st);
+    } else if (m.alt) {
+        altLetter(c, view, st);
+    }
+}
+
+// Shortcuts for tabs and quitting. They are checked before everything else and do not reach the editor.
+// Returns true if the key was one of them.
+bool appCommandFor(const Input::KeyEvent& k, InputState& st) {
+    using Input::Key;
+    const Mods& m = k.mods;
+    auto set = [&](Request::Kind c, int arg = 0) { st.post(Request::of(c, arg)); return true; };
+
+    if (k.key == Key::Char && m.ctrl && !m.alt && !m.shift && k.ch == 'q') return set(Request::Kind::Quit);   // works in every mode
+    if (st.mode == InputMode::Prompt) return false;                  // the file browser has the keyboard
+
+    if (k.key == Key::Char && m.ctrl && !m.alt && !m.shift) {
+        if (k.ch == 't') return set(Request::Kind::NewTab);
+        if (k.ch == 'w') return set(Request::Kind::CloseTab);
+    }
+    if (k.key == Key::Tab && m.ctrl && !m.alt) return set(m.shift ? Request::Kind::PrevTab : Request::Kind::NextTab);
+    if (k.key == Key::PageUp || k.key == Key::PageDown) {
+        bool down = k.key == Key::PageDown;
+        if (m.ctrl && !m.alt && !m.shift) return set(down ? Request::Kind::NextTab : Request::Kind::PrevTab);
+        if (m.alt && m.shift && !m.ctrl) return set(down ? Request::Kind::MoveTabRight : Request::Kind::MoveTabLeft);
+    }
+    if (k.key == Key::Char && m.alt && !m.ctrl && !m.shift) {
+        if (k.ch >= '1' && k.ch <= '8') return set(Request::Kind::GotoTab, static_cast<int>(k.ch - '1'));
+        if (k.ch == '9') return set(Request::Kind::GotoLastTab);
+        if (k.ch == 't') return set(Request::Kind::ReopenTab);
+    }
+    return false;
+}
+
+void dispatchKey(const Input::KeyEvent& k, TextView& view, InputState& st) {
+    using Input::Key;
+    const Mods& m = k.mods;
+    switch (k.key) {
+        case Key::Escape: escapeKey(view, st); break;
+        case Key::Enter: enterKey(view, st, m); break;
+        case Key::Backspace: backspaceKey(m.ctrl, view, st); break;
+        case Key::Tab: tabKey(m.shift, view, st); break;
+        case Key::Delete: deleteKey(m, view, st); break;
+        case Key::Up: case Key::Down: case Key::Left: case Key::Right: arrowKey(k.key, m, view, st); break;
+        case Key::Home: homeKey(m, view, st); break;
+        case Key::End: endKey(m, view, st); break;
+        case Key::PageUp: pageKey(false, m, view, st); break;
+        case Key::PageDown: pageKey(true, m, view, st); break;
+        case Key::Char: charKey(k, view, st); break;
+        default: break;                                              // Insert and function keys: ignored
+    }
+}
+
+// ---------------------------------------------------------------- mouse
+
+void selectWordAt(TextView& view, Position p) {
+    const std::string& line = view.buffer().line(p.line);
+    if (line.empty()) { view.moveCursor(p); return; }
+
+    auto cls = [](unsigned char ch) {
+        if (ch == ' ' || ch == '\t') return 0;
+        return (std::isalnum(ch) || ch == '_' || ch >= 0x80) ? 1 : 2;
+    };
+    size_t i = p.col < line.size() ? p.col : line.size() - 1;
+    int k = cls(static_cast<unsigned char>(line[i]));
+    size_t a = i, b = i + 1;
+    while (a > 0 && cls(static_cast<unsigned char>(line[a - 1])) == k) --a;
+    while (b < line.size() && cls(static_cast<unsigned char>(line[b])) == k) ++b;
+    view.select(Position{p.line, a}, Position{p.line, b});
+}
+
+void selectLineAt(TextView& view, Position p) {
+    const TextBuffer& tb = view.buffer();
+    Position from{p.line, 0};
+    Position to = p.line + 1 < tb.lineCount() ? Position{p.line + 1, 0}
+                                              : Position{p.line, tb.lineLength(p.line)};
+    view.select(from, to);
+}
+
+}
+
+// ================================================================ entry points
+
+void handleKey(const Input::KeyEvent& k, TextView& view, InputState& st) {
+    if (appCommandFor(k, st)) return;            // tab and quit shortcuts: the program carries them out
+    beginEvent(st, false);
+    EditorKeys ek(st, view, true);               // keys go to the text if you clicked on it
+    dispatchKey(k, view, st);
+}
+
+void handleText(const std::string& text, TextView& view, InputState& st) {
+    if (text.empty()) return;
+    beginEvent(st, false);
+    EditorKeys ek(st, view, true);
+    typeText(text, view, st);
+}
+
+void handlePaste(const std::string& text, TextView& view, InputState& st) {
+    beginEvent(st, false);
+    EditorKeys ek(st, view, true);
+    pasteText(text, view, st);
+}
+
+void handleMouse(const Input::MouseEvent& me, TextView& view, InputState& st) {
+    using Input::Button;
+    using Input::Region;
+    using Kind = Input::MouseEvent::Kind;
+
+    if (me.region == Region::TabBar && st.mode != InputMode::Prompt) {   // the program owns the tab bar
+        Request r = Request::of(Request::Kind::TabBarMouse);
+        r.mouse = me;
+        st.post(std::move(r));
+        return;
+    }
+    beginEvent(st, true);                        // mouse events never send keys to the text (no EditorKeys)
+    const bool left = me.button == Button::Left;
+    if (me.kind == Kind::Release) { st.minimapDrag = false; st.stickyDrag = false; }
+
+    if (st.mode == InputMode::Prompt) {                                  // the file browser is open: it gets the mouse
+        if (me.kind == Kind::Wheel) st.browser.scroll(me.wheelRows);
+        else if (me.kind == Kind::Press && left && me.region == Region::Browser && me.row >= 0)
+            acceptBrowserResult(st.browser.click(static_cast<size_t>(me.row)), st);
+        return;
+    }
+    if (me.kind == Kind::Release) return;
+
+    if ((st.mode == InputMode::Find || st.mode == InputMode::Replace) && me.region == Region::FindPanel) {
+        st.editorSelected = false;
+        st.editorFocus = false;                                          // clicking the panel gives the keyboard back to it
+        if (me.kind == Kind::Press && left) panelAction(static_cast<FindPanel::Action>(me.control), view, st);
+        return;
+    }
+
+    if (me.region == Region::Minimap && me.kind == Kind::Press && left) {   // pressed on the minimap
+        st.minimapDrag = true;
+        st.post(Request::of(Request::Kind::MinimapPress, me.row + 1));
+        st.status = "minimap";
+        return;
+    }
+    if (me.kind == Kind::Drag && left && st.minimapDrag) {               // dragging it (the mouse may leave the minimap)
+        st.post(Request::of(Request::Kind::MinimapDrag, me.row + 1));
+        return;
+    }
+    if (me.region == Region::Sticky && me.kind == Kind::Press && left) { // a pinned line
+        st.post(Request::of(Request::Kind::StickyClick, me.row + 1));    // the program scrolls to it
+        st.stickyDrag = true;
+        if (st.mode != InputMode::Edit) st.editorFocus = true;           // find bar open: the text gets the keyboard
+        st.status = "go to pinned line";
+        return;
+    }
+    if (me.kind == Kind::Drag && st.stickyDrag) return;                  // dragging after such a click: no selection
+    if (me.kind == Kind::Wheel) {
+        st.post(Request::of(Request::Kind::ScrollWheel, me.wheelRows));
+        st.status = "scroll";
+        return;
+    }
+    if (me.region != Region::Text && me.region != Region::FoldMarker) return;   // status bars, empty space ...
+
+    Position p = view.buffer().clamp(me.pos);
+    const bool shift = me.mods.shift, alt = me.mods.alt;
+
+    if (me.kind == Kind::Press && left) {
+        bool onMarker = me.region == Region::FoldMarker && !alt && !shift && view.folding().canFold(me.pos.line);
+        if (onMarker) {
+            view.toggleFoldAt(me.pos.line);
+            st.status = "toggle fold";
+        } else if (alt) { view.addCursor(p); st.status = "add cursor"; }
+        else if (shift) { view.moveCursor(p, true); st.status = "extend selection"; }
+        else if (me.clicks == 2) { selectWordAt(view, p); st.status = "select word"; }
+        else if (me.clicks >= 3) { selectLineAt(view, p); st.status = "select line"; }
+        else { view.moveCursor(p); st.status = "click"; }
+    } else if (me.kind == Kind::Drag && left) {                          // moved with the left button held
+        view.moveCursor(p, true);
+        st.status = "drag select";
+    }
+    if (st.mode != InputMode::Edit && left && (me.kind == Kind::Press || me.kind == Kind::Drag)) {
+        st.editorSelected = true;                                        // find bar open and you clicked on the text:
+        st.editorFocus = true;                                           // the text gets the keyboard
+    }
+}
+
+void handleEvent(const Input::Event& e, TextView& view, InputState& st) {
+    switch (e.type) {
+        case Input::Event::Type::Key: handleKey(e.key, view, st); break;
+        case Input::Event::Type::Text: handleText(e.text, view, st); break;
+        case Input::Event::Type::Paste: handlePaste(e.text, view, st); break;
+        case Input::Event::Type::Mouse: handleMouse(e.mouse, view, st); break;
+    }
+}
+
+void refreshFind(TextView& view, InputState& st) {
+    if (st.mode != InputMode::Find && st.mode != InputMode::Replace) return;
+    st.findInSel = false;                    // a selection of the other tab means nothing here
+    view.findOpen();
+    runFind(view, st);
+}
